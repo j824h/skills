@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workspace Rebind"
+  short_description: "Repair stale Codex workspace path bindings"
+  default_prompt: "Use $codex-workspace-rebind to move Codex workspace and thread bindings from an old absolute path to a new one after a folder rename."
