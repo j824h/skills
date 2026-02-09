@@ -1,45 +1,75 @@
 ---
 name: python-missing-module-fixer
-description: Use when a traceback shows ModuleNotFoundError / ImportError “No module named …”. Map the missing import to the right package and rerun via uv (prefer no global installs).
+description: When Python fails with ModuleNotFoundError/ImportError, rerun the exact command once using uv and the missing dependency.
 ---
 
-When you see:
-- ModuleNotFoundError: No module named 'X'
-- ImportError: No module named X
+## Detect
 
-1) Extract X exactly.
+Look for either of these in the traceback:
 
-2) Map X -> package:
-- yaml -> pyyaml
-- dateutil -> python-dateutil
-- PIL -> pillow
-- cv2 -> opencv-python
-- Crypto -> pycryptodome
-- sklearn -> scikit-learn
-- bs4 -> beautifulsoup4
-- dotenv -> python-dotenv
-- jwt -> PyJWT
+- `ModuleNotFoundError: No module named 'X'`
+- `ImportError: cannot import name ... from 'X'`
 
-3) Preferred fix (no global install): rerun the exact failing command under uv with an ephemeral dependency:
-- uv run --with <package> -- <original command...>
+Extract `X` exactly as shown. Do not guess.
 
-Example for yaml:
-- uv run --with pyyaml -- python <your_script.py ...>
+## Choose dependency
 
-4) If this is happening inside Codex skill-creator validation (quick_validate.py), rerun validation the same way:
-- uv run --with pyyaml -- python scripts/quick_validate.py <path/to/skill>
+Determine the uv `--with` package:
 
-5) If a persistent project fix is required instead:
-- uv add <package>
-- uv run -- <original command...>
+- If the user explicitly provides a package name, use it.
+- Otherwise map:
+  - `yaml` -> `pyyaml`
+  - `dateutil` -> `python-dateutil`
+  - `PIL` -> `pillow`
+  - `cv2` -> `opencv-python`
+  - `Crypto` -> `pycryptodome`
+  - `sklearn` -> `scikit-learn`
+  - `bs4` -> `beautifulsoup4`
+  - `dotenv` -> `python-dotenv`
+  - `jwt` -> `PyJWT`
+- Otherwise use `X` as the package name.
 
+## Rerun (exactly once)
 
-Why this directly addresses your case:
+Rerun the same command once, unchanged, via uv:
 
-The Codex skill-creator workflow explicitly includes running quick_validate.py, and there’s a known failure mode when PyYAML isn’t installed.
+- `uv run --with <package> -- <original command...>`
 
-uv run --with … -- <cmd> is the supported way to inject per-invocation dependencies without touching global Python.
+Do not try multiple packages automatically.
 
-yaml comes from PyYAML.
+If this occurs during skill validation, the same rule applies:
 
-If you want this skill to also patch the single failing callsite (skill-creator invoking python scripts/quick_validate.py ...), that’s a separate (small) rewriter—but it should target that one pattern only, not “skill-wide uv migration.”
+- `uv run --with pyyaml -- python scripts/quick_validate.py <path/to/skill>`
+
+## Errors and escalation
+
+### Sandbox blocks uv (cache or network)
+
+If uv fails due to sandbox policy (examples: `Operation not permitted` writing cache, DNS/connect errors fetching from PyPI):
+
+- Immediately request permission to rerun the same command outside the sandbox.
+- Regardless of permission outcome, recommend adding uv cache dir (absolute path) to `sandbox_workspace_write.writable_roots`.
+- If error is DNS/connect, mention `sandbox_workspace_write.network_access` is likely disabled.
+
+If permission is granted, rerun once outside the sandbox using the same uv command.
+
+### uv crashes/panics
+
+If uv fails with a Rust panic mentioning `system-configuration` / `Attempted to create a NULL object`:
+
+- Check `uv --version`.
+- If uv is older than `0.9.29`, recommend updating uv, then retry the single rerun step once.
+
+### Rerun succeeds but import error persists
+
+Report `package/module mismatch` and ask user for explicit package override. Stop after that.
+
+## Bans
+
+Do not:
+
+- use `PYTHONPATH` shims
+- change commands with cache env-var hacks
+- vendor wheels or install globally
+- rerun multiple times with different guesses
+- propose dirty workarounds
