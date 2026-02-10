@@ -1,95 +1,143 @@
 ---
 name: codex-workspace-rebind
-description: Repair stale Codex workspace and thread path bindings after a project folder rename by updating local Codex state files and verifying the new path is fully bound.
+description: Rebind Codex local state from an old absolute workspace path to a new path after a project root move, with backup and verification.
 ---
 
-# Codex Workspace Rebind
+# Codex workspace rebind
 
-Rebind Codex state from an old absolute workspace path to a new path after a folder rename.
+Repair stale Codex workspace bindings after a workspace folder is moved/renamed.
 
-## Workflow
+## Use when
+- Codex shows a missing working directory for a known project.
+- A project was moved from one absolute path to another.
+- Threads/sessions still resolve to the old workspace root.
 
-1. Collect inputs.
-- Collect old absolute path.
-- Collect new absolute path.
+## Inputs
+- `OLD_PATH`: old absolute workspace path
+- `NEW_PATH`: new absolute workspace path
 
-2. Verify filesystem truth first.
-- Check both paths with `test -e` or `ls -ld`.
+## Targets
+- `~/.codex/.codex-global-state.json`
+- Every `~/.codex/sessions/**/*.jsonl` file containing `OLD_PATH`
+
+## Safety rules
+- Do not run destructive git commands.
+- Do not delete session files.
+- Do not edit SQLite for this operation.
+- If replacement scope is ambiguous, stop and confirm with the user.
+
+---
+
+## Procedure
+
+### 1) Preflight
+- Require absolute paths for `OLD_PATH` and `NEW_PATH`.
+- Check filesystem state with `test -e`.
 - If `OLD_PATH` exists and `NEW_PATH` does not, run `mv "$OLD_PATH" "$NEW_PATH"`.
-- Re-check both paths after `mv`.
-- Stop and confirm with the user if `NEW_PATH` still does not exist.
+- Fail if `NEW_PATH` does not exist after preflight.
 
-3. Identify files to patch.
-- Target `~/.codex/.codex-global-state.json`.
-- Target session files in `~/.codex/sessions/**/*.jsonl` that contain the old path.
+### 2) Discover patch set
+- Always include `~/.codex/.codex-global-state.json` as a target (if present).
+- Find session files under `~/.codex/sessions` that contain the literal `OLD_PATH`.
 
-4. Back up before edits.
-- Copy each target file to `/tmp` with a timestamped suffix.
-- Preserve unique names in `/tmp` by encoding the full source path.
-- Report backup paths.
+### 3) Backup (mandatory)
+- Copy each target to `/tmp` with a timestamped suffix.
+- Encode source path in backup filename to avoid collisions.
+- Print all backup locations.
 
-5. Patch bindings.
-- Replace the exact old absolute path string with the new absolute path string in selected files.
-- Keep edits minimal and avoid unrelated key changes.
+### 4) Patch (minimal edits)
+- Replace the exact `OLD_PATH` string with `NEW_PATH` in every target file.
+- Do not modify unrelated fields.
 
-6. Verify patch.
-- Confirm no old path remains in patched files via `rg`.
-- Confirm global keys include the new path:
+### 5) Verify (must pass)
+- Confirm no `OLD_PATH` remains in target files.
+- Validate JSON parse for global state file.
+- Validate JSONL parse for each session file.
+- Confirm global keys include `NEW_PATH`:
   - `electron-saved-workspace-roots`
   - `active-workspace-roots`
   - `electron-workspace-root-labels`
-- Confirm session `session_meta.payload.cwd` uses the new path.
-- Validate edited JSON/JSONL entries parse cleanly.
+- Confirm session `session_meta.payload.cwd` references `NEW_PATH`.
 
-7. Finalize.
+### 6) User follow-up
 - Ask the user to restart Codex.
-- Re-check for stale project entry and cwd warning.
+- Re-open the project/thread and confirm no stale cwd warning.
 
-## Safety Rules
+---
 
-- Do not run destructive git commands.
-- Do not delete session files.
-- Do not edit SQLite for this operation; workspace/thread binding is in JSON/JSONL state.
-- Stop and ask for confirmation when replacement scope is ambiguous.
-
-## Quick Commands
+## Quick commands (reference implementation)
 
 ```bash
-rg -n --hidden --no-ignore -S "$OLD_PATH" ~/.codex/.codex-global-state.json ~/.codex/sessions
+set -euo pipefail
 
+: "${OLD_PATH:?Set OLD_PATH}"
+: "${NEW_PATH:?Set NEW_PATH}"
+
+case "$OLD_PATH" in /*) ;; *) echo "OLD_PATH must be absolute"; exit 1;; esac
+case "$NEW_PATH" in /*) ;; *) echo "NEW_PATH must be absolute"; exit 1;; esac
+
+# Preflight move (only if OLD exists and NEW doesn't)
 if test -e "$OLD_PATH" && ! test -e "$NEW_PATH"; then
   mv "$OLD_PATH" "$NEW_PATH"
 fi
 
-TS="$(date +%Y%m%d-%H%M%S)"
-FILES=(
-  "$HOME/.codex/.codex-global-state.json"
-)
-while IFS= read -r f; do
-  FILES+=("$f")
-done < <(rg -l --hidden --no-ignore -S "$OLD_PATH" "$HOME/.codex/sessions")
+if ! test -e "$NEW_PATH"; then
+  echo "NEW_PATH does not exist after preflight: $NEW_PATH"
+  exit 1
+fi
 
-for f in "${FILES[@]}"; do
+GLOBAL="$HOME/.codex/.codex-global-state.json"
+mapfile -t SESSION_FILES < <(rg -l --hidden --no-ignore -S "$OLD_PATH" "$HOME/.codex/sessions" || true)
+
+TARGETS=()
+test -f "$GLOBAL" && TARGETS+=("$GLOBAL")
+((${#SESSION_FILES[@]})) && TARGETS+=("${SESSION_FILES[@]}")
+
+if ((${#TARGETS[@]} == 0)); then
+  echo "No targets found (no global state file and no session files matched)."
+  exit 0
+fi
+
+TS="$(date +%Y%m%d-%H%M%S)"
+
+# Backup
+for f in "${TARGETS[@]}"; do
+  test -f "$f" || continue
   safe_name="$(printf '%s' "$f" | sed 's|/|__|g')"
   backup="/tmp/${safe_name}.bak.${TS}"
   cp "$f" "$backup"
-  echo "$f -> $backup"
+  echo "backup: $f -> $backup"
 done
 
-# Patch each selected file.
-for f in "${FILES[@]}"; do
-  perl -0pi -e 's|\Q'$OLD_PATH'\E|'"$NEW_PATH"'|g' "$f"
+# Patch (exact literal replacement)
+for f in "${TARGETS[@]}"; do
+  test -f "$f" || continue
+  OLD_PATH="$OLD_PATH" NEW_PATH="$NEW_PATH" \
+    perl -0pi -e 's/\Q$ENV{OLD_PATH}\E/$ENV{NEW_PATH}/g' "$f"
 done
 
-# Verify no old path remains.
-rg -n --hidden --no-ignore -S "$OLD_PATH" "${FILES[@]}"
+# Verify: no OLD_PATH remains
+if rg -n --hidden --no-ignore -S "$OLD_PATH" "${TARGETS[@]}"; then
+  echo "old path still present after patch"
+  exit 1
+fi
 
-# Validate edited JSON and JSONL parse cleanly.
-jq empty "$HOME/.codex/.codex-global-state.json"
-for f in "${FILES[@]}"; do
-  case "$f" in
-    *.json) jq empty "$f" >/dev/null ;;
-    *.jsonl) jq -c . "$f" >/dev/null ;;
-  esac
+# Verify: parse
+test -f "$GLOBAL" && jq empty "$GLOBAL" >/dev/null
+for f in "${SESSION_FILES[@]}"; do
+  jq -c . "$f" >/dev/null
 done
+
+# Verify: global keys include NEW_PATH (required if GLOBAL exists)
+if test -f "$GLOBAL"; then
+  jq -e --arg p "$NEW_PATH" '."electron-saved-workspace-roots" | index($p)' "$GLOBAL" >/dev/null
+  jq -e --arg p "$NEW_PATH" '."active-workspace-roots" | index($p)' "$GLOBAL" >/dev/null
+  jq -e --arg p "$NEW_PATH" '."electron-workspace-root-labels"[$p]' "$GLOBAL" >/dev/null
+fi
+
+# Verify: session_meta.payload.cwd references NEW_PATH (required if any session file matched)
+for f in "${SESSION_FILES[@]}"; do
+  jq -e --arg p "$NEW_PATH" 'select(.type=="session_meta" and .payload.cwd==$p)' "$f" >/dev/null
+done
+
 ```
